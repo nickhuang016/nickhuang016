@@ -1,0 +1,134 @@
+def git_tag = ''
+pipeline{
+  agent any
+  parameters {
+    gitParameter branchFilter: 'origin/(.*)', defaultValue: 'master', name: 'BRANCH', type: 'PT_BRANCH'
+  }
+  environment {
+    app='backoffice-v1-web-addonsjob'
+    cluster='fat'
+    password='C7cKwnrS1GjTBantBXAV'
+    namespace='test16'
+  }
+   stages{
+      
+       
+      stage ("pull code") {
+        steps {
+            script {
+                currentBuild.displayName = "#${env.BUILD_NUMBER} origin/${params.BRANCH}"
+            }
+            git branch: "${params.BRANCH}", url: "git@github.com:storehubnet/backoffice-v1-web.git"
+        }
+      }
+      stage('>>> I18N...') {
+            steps {
+                nodejs('v12.22.7') {
+                    sh "/data/ops/ci/libs/get_config-shared.py --env ${env.cluster} --appid backoffice-v1-web --cluster ${env.namespace}"
+                    sh "cat .env | grep -v '\"' | grep -v ' ' > .env.i18n"
+                        
+                    sh '''
+                        disallowIncompleteParam=""
+                    
+                        export `grep -v \\'#\\' .env.i18n | xargs`
+                        source $WORKSPACE/.env.i18n
+                        
+                        echo ">>> RUN I18N..."
+                        if [ "$disallowIncomplete" = true ]; then
+                          disallowIncompleteParam="--disallow-incomplete"
+                        fi
+                        npx @storehub/i18n-cli@latest terms download --snapshot=$snapshotType $disallowIncompleteParam || exit 1
+                    '''
+                }
+            }
+      }
+      stage ("prepare stage") {
+          steps {
+               script {
+                git_tag = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+                current_tag = sh(returnStdout: true, script: "curl -s -u admin:${env.password} -X GET https://harbor.mymyhub.com/api/repositories/${env.cluster}%2Fbackoffice-v1-web/tags/${git_tag} -H \"accept: application/json\"").trim()
+             
+                if(current_tag.contains("404")) {
+                    env.buildImage = true
+                }else {
+                    env.buildImage = false
+                }
+                
+            }
+          }
+      }
+      stage ("init submodule") {
+          when { expression { return fileExists ('.gitmodules') } }
+          steps{
+              sh "git submodule update --init"
+          }
+      }
+      stage ("build image") {
+        when {
+            expression {
+                return env.buildImage == 'true'
+            }
+        }
+        steps{
+            
+            sh '''
+                #load envrionment 
+                source /data/ops/deploy/for_kubernetes/libsqa/common.inc
+                echo "${DOCKER_PSW}" | docker login ${DOCKER_REG} -u ${DOCKER_USR} --password-stdin 2>/dev/null
+            '''
+            script {
+                 if (env.app == "alertservice") {
+                    sh "docker build -f Dockerfile.alertservice -t harbor.mymyhub.com/${env.cluster}/${env.app}:${git_tag} ."
+                } else if (env.app.contains("backoffice-v1-web")) {
+                    sh "docker build -t harbor.mymyhub.com/${env.cluster}/backoffice-v1-web:${git_tag} ."
+                }else {
+                    sh "docker build -t harbor.mymyhub.com/${env.cluster}/${app}:${git_tag} ."
+                }
+                
+                if (env.app.contains("backoffice-v1-web")) {
+                    sh "docker push harbor.mymyhub.com/${env.cluster}/backoffice-v1-web:${git_tag}"
+                }else {
+                    sh "docker push harbor.mymyhub.com/${env.cluster}/${env.app}:${git_tag}"
+                }
+            }
+        }
+      }
+        stage ("helm package") {
+        
+            steps{
+                sh ''' 
+                source /data/ops/deploy/for_kubernetes/libsqa/common.inc 
+                helm repo add --username=${HELM_USR} --password=${HELM_PSW} ${cluster} ${HELM_REPO}/${cluster}
+                '''
+                sh "helm repo update"
+                sh "rm -f ${app}*.tgz"
+                sh "helm pull ${cluster}/${app}"
+                sh "tar xvf ${env.app}*.tgz"
+                sh "rm -f ${app}*.tgz"
+                sh "python3 /data/ops/deploy/for_kubernetes/shared_yaml.py -a ${env.app} -c ${env.namespace} -e ${env.cluster}"
+                sh "helm package ./${env.app}"
+                sh "helm push ${env.app}*.tgz ${env.cluster}"
+            }
+        }   
+        stage("deploy to cluster"){
+          steps{
+               
+               sh '''
+                new_version="`cat ${WORKSPACE}/next_version`"
+                ssh  root@192.167.0.125  <<ENDSSH
+                helm repo update
+                if [ ${namespace} = "test18" ];then
+            		helm upgrade ${app} --version ${new_version} ${cluster}/${app} --namespace=${namespace}
+  	            else
+        		    helm uninstall ${app} --namespace=${namespace}
+        		    sleep 3
+        		    helm install ${app} ${cluster}/${app} --namespace=${namespace} --version ${new_version}
+  	            fi
+ENDSSH
+               '''
+          }
+        }
+      
+    
+  } 
+}
